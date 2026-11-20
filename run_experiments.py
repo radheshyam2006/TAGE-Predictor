@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Run all experiments: bimodal / gshare / TAGE on a set of traces, collect IPC and branch MPKI.
+"""Run the experiments: bimodal / gshare / TAGE on a set of traces, collecting IPC and branch MPKI.
 
   python3 run_experiments.py --champsim ~/ChampSim/bin --traces ~/traces \
-        --warmup 20000000 --sim 100000000 --out results/results.csv [--quick] [--exp E1,E2,...]
+        --warmup 5000000 --sim 20000000 --exp E1,E2,E3 --jobs 6 --out results/results.csv
 
-Binaries expected in --champsim: champsim_bimodalp, champsim_gsharep, champsim_tage (see README for the
-three config files).  Every run is one process; results are appended as CSV rows so a crashed sweep resumes.
-Storage budgets count ONLY the predictor tables (counters + tags + u bits); see REPORT section 3.
+Experiments:  E0 = check against the original version's 8 variants | E1 = equal-storage comparison, 4-64 KB |
+              E2 = number of tagged tables | E3 = longest / shortest history length.
+Binaries expected in --champsim: champsim_bimodalp, champsim_gsharep, champsim_tage (built by setup.sh).
+One process per run; results are appended to the CSV, so an interrupted sweep resumes where it stopped.
+Storage counts only the predictor tables (counters + tags + u bits); history registers are excluded for all predictors.
 """
 import argparse, csv, glob, itertools, json, math, os, re, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
@@ -43,48 +45,31 @@ def tbits(e):  # storage of an explicit TAGE config
 ORIG = {'TAGE_NT': 4, 'TAGE_LOGBASE': 13, 'TAGE_LOGT': 10, 'TAGE_TAG': 9, 'TAGE_LENS': '5,15,44,130'}
 
 def build_jobs(exps, budgets_kb, main_kb):
+    """The experiments that were run. main_kb (default 16) is the budget used for E2 and E3."""
     jobs = []  # (exp, predictor, budget_kb, label, env, bits)
     B = lambda kb: kb * 1024 * 8
-    if 'E0' in exps:        # replicate the teammate's original 8 TAGE variants (checks the port reproduces results_final.csv)
-        V = {'t4_default': ({}, ), 't2': ({'TAGE_NT': 2, 'TAGE_LENS': '8,44'},), 't3': ({'TAGE_NT': 3, 'TAGE_LENS': '5,20,80'},),
-             't4_short': ({'TAGE_LENS': '2,4,8,16'},), 't4_long': ({'TAGE_LENS': '8,32,128,256'},),
-             't4_small': ({'TAGE_LOGT': 8},), 't4_big': ({'TAGE_LOGT': 12},), 't4_huge': ({'TAGE_LOGT': 14},)}
+    if 'E0' in exps:        # check: the teammate's original 8 TAGE variants through this build (must match original_version/results_p15.csv)
+        V = {'t4_default': {}, 't2': {'TAGE_NT': 2, 'TAGE_LENS': '8,44'}, 't3': {'TAGE_NT': 3, 'TAGE_LENS': '5,20,80'},
+             't4_short': {'TAGE_LENS': '2,4,8,16'}, 't4_long': {'TAGE_LENS': '8,32,128,256'},
+             't4_small': {'TAGE_LOGT': 8}, 't4_big': {'TAGE_LOGT': 12}, 't4_huge': {'TAGE_LOGT': 14}}
         e, b = size_bimodal(4 * 1024 * 8); jobs.append(('E0_replicate', 'bimodal', 4, 'bimodal', e, b))
         e, b = size_gshare(4 * 1024 * 8);  jobs.append(('E0_replicate', 'gshare', 4, 'gshare', e, b))
-        for name, (ov,) in V.items():
+        for name, ov in V.items():
             e = {**ORIG, **ov}; jobs.append(('E0_replicate', 'tage', 0, name, e, tbits(e)))
-    if 'E1' in exps:        # main comparison and storage-budget sweep, equal budget for all three predictors
+    if 'E1' in exps:        # bimodal, gshare, TAGE at equal storage
         for kb in budgets_kb:
             e, b = size_bimodal(B(kb)); jobs.append(('E1', 'bimodal', kb, 'bimodal', e, b))
             e, b = size_gshare(B(kb));  jobs.append(('E1', 'gshare', kb, 'gshare', e, b))
             e, b = size_tage(B(kb), 4); jobs.append(('E1', 'tage', kb, 'tage_nt4', e, b))
-    if 'E2' in exps:        # number of tagged tables: same geometric series 5..130 resampled, equal total budget
-        for nt in [0, 1, 2, 3, 4, 5, 6, 8]:
+    if 'E2' in exps:        # number of tagged tables, same total storage
+        for nt in [1, 2, 3, 4, 6]:
             e, b = size_tage(B(main_kb), nt); jobs.append(('E2', 'tage', main_kb, f'nt={nt}', e, b))
-        ref, _ = size_tage(B(main_kb), 4)   # E2b: every table the same size, so storage grows with nt
-        for nt in [0, 1, 2, 3, 4, 5, 6, 8]:
-            e = {**ref, 'TAGE_NT': nt, 'TAGE_LENS': lens(geo(max(nt, 1)))}
-            jobs.append(('E2b_fixed_tables', 'tage', main_kb, f'nt={nt}', e, tbits(e) if nt else (1 << ref['TAGE_LOGBASE']) * 2))
-    if 'E3' in exps:        # history lengths (NT=4, fixed budget); geometric series from min to max
+    if 'E3' in exps:        # history lengths: longest (shortest = 5) and shortest (longest = 130), 4 tables
         base, b = size_tage(B(main_kb), 4)
-        for mx in [20, 40, 80, 130, 260, 500, 1000]:
+        for mx in [20, 60, 130, 300, 600]:
             jobs.append(('E3a_maxh', 'tage', main_kb, f'maxh={mx}', {**base, 'TAGE_LENS': lens(geo(4, 5, mx))}, b))
-        for mn in [2, 3, 5, 8, 12, 20]:
+        for mn in [2, 10, 20]:
             jobs.append(('E3b_minh', 'tage', main_kb, f'minh={mn}', {**base, 'TAGE_LENS': lens(geo(4, mn, 130))}, b))
-        for name, ls in [('geometric 5-15-44-130', '5,15,44,130'), ('linear 33-65-98-130', '33,65,98,130'),
-                         ('all-short 5-6-7-8', '5,6,7,8'), ('all-long 100-110-120-130', '100,110,120,130')]:
-            jobs.append(('E3c_shape', 'tage', main_kb, name, {**base, 'TAGE_LENS': ls}, b))
-    if 'E4' in exps:        # tag width (partial tagging) and update-policy ablations
-        ref, _ = size_tage(B(main_kb), 4)       # table sizes fixed; only the tag width changes
-        for tg in [4, 6, 8, 9, 10, 12, 14]:
-            e = {**ref, 'TAGE_TAG': tg}
-            jobs.append(('E4a_tag_fixed', 'tage', main_kb, f'tag={tg}', e, tbits(e)))
-        b = tbits(ref)
-        jobs.append(('E4b_policy', 'tage', main_kb, 'original policy', ref, b))
-        jobs.append(('E4b_policy', 'tage', main_kb, 'no u aging', {**ref, 'TAGE_UPERIOD': 0}, b))
-        jobs.append(('E4b_policy', 'tage', main_kb, '+ use_alt_on_na', {**ref, 'TAGE_USEALT': 1}, b))
-        jobs.append(('E4b_policy', 'tage', main_kb, 'alloc 2 entries', {**ref, 'TAGE_NALLOC': 2}, b))
-        jobs.append(('E4b_policy', 'tage', main_kb, 'train on cond. branches only', {**ref, 'TAGE_CONDONLY': 1}, b))
     return jobs
 
 def run_one(binpath, trace, env_extra, warm, sim):
@@ -100,7 +85,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--champsim', default='~/ChampSim/bin'); ap.add_argument('--traces', required=True)
     ap.add_argument('--warmup', type=int, default=20_000_000); ap.add_argument('--sim', type=int, default=100_000_000)
-    ap.add_argument('--out', default='results/results.csv'); ap.add_argument('--exp', default='E0,E1,E2,E3,E4')
+    ap.add_argument('--out', default='results/results.csv'); ap.add_argument('--exp', default='E1,E2,E3')
     ap.add_argument('--budgets', default='4,8,16,32,64'); ap.add_argument('--main-kb', type=int, default=16)
     ap.add_argument('--jobs', type=int, default=os.cpu_count()); ap.add_argument('--tag', default='', help='label stored in CSV (e.g. synthetic)')
     a = ap.parse_args()

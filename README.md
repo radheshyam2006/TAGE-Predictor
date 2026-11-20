@@ -1,157 +1,132 @@
-# TAGE Branch Predictor in ChampSim: Project README
+# Simplified TAGE branch predictor in ChampSim
 
-## 1. What this project is
+Implementation of a simplified **TAGE** predictor (base predictor + 4 tagged tables) in ChampSim's branch-predictor
+interface, compared with **bimodal** and **gshare** on three SPEC CPU2006 traces. We measure how the number of tables,
+the history lengths and the total storage affect **MPKI** (branch mispredictions per 1000 instructions, lower is better)
+and **IPC** (instructions per cycle, higher is better).
 
-A CPU must guess which way a branch (`if`, loop, ...) will go *before* it knows, so it can keep fetching instructions. A wrong guess (misprediction) flushes the pipeline and wastes cycles.
+Reference: Seznec & Michaud, *A case for (partially) tagged geometric history length branch prediction*, JILP 2006
+(primary); Seznec, *A new case for the TAGE branch predictor*, MICRO 2011 (supplementary).
 
-This project:
-1. Implements a **simplified TAGE** branch predictor inside **ChampSim** (a CPU simulator).
-2. Compares it to two classic predictors, **bimodal** and **gshare**, on real program traces.
-3. Studies how the **number of tables**, **history lengths** and **storage size** change
-   - **MPKI** = mispredictions per 1000 instructions (lower is better)
-   - **IPC** = instructions per cycle (higher is better)
-
-## 2. What was installed / downloaded, and why
-
-| Thing | Why |
+## 1. The predictor (`branch/tage/`)
+| Part | Choice |
 |---|---|
-| **ChampSim** (`ChampSim/`, cloned from GitHub) | The trace-driven CPU simulator. It models the pipeline, caches and branch predictors, and replays a recorded instruction trace. |
-| **vcpkg** (git submodule, `ChampSim/vcpkg`) and the libraries it installed (`vcpkg_installed/`: CLI11, fmt, zlib, lzma, bzip2) | ChampSim's dependencies. They are used for command-line parsing, text formatting, and reading compressed traces. |
-| `g++`, `make`, `cmake` (already on the system) | To compile ChampSim. No sudo was needed. |
-| **3 SPEC CPU2006 traces** (`traces/`, from the DPC-3 site): `400.perlbench-41B`, `403.gcc-16B`, `445.gobmk-17B` (about 1 GB total) | The workload. A trace is a recorded stream of instructions, including every branch and its outcome. These three are branch-heavy integer programs. |
+| Base predictor T0 | Bimodal table, 2-bit counters, indexed by PC (default 8192 entries) |
+| Tagged tables T1..T4 | 1024 entries each by default; entry = 9-bit partial tag + 3-bit signed counter + 2-bit useful counter `u` |
+| History lengths | Geometric series 5, 15, 44, 130 (global branch history, XOR-folded to index and tag width) |
+| Prediction | The matching table with the longest history is the *provider*; if no tag matches the base predictor answers. The next match (or the base) is the *alternate* |
+| Update | The provider's counter moves toward the outcome. `u` goes up when the provider is right and the alternate wrong, down in the opposite case |
+| Allocation | On a misprediction, take the first longer-history table whose entry has `u = 0` and write a new entry (weak counter, `u = 0`). If none is free, decrement `u` of the candidates |
+| Aging | All `u` counters are halved every 2^18 updates |
 
-Build flow: `./config.sh champsim_config.json` generates the build setup for a chosen config (CPU parameters plus the branch predictor name). `make` then produces `bin/<executable_name>`.
+Not implemented (they are in the papers): use-alternate-on-newly-allocated, several allocations per misprediction,
+path history, loop predictor, statistical corrector.
 
-## 3. Background you need
+Every parameter can be set by an environment variable (`TAGE_NT`, `TAGE_LENS`, `TAGE_LOGT`, `TAGE_TAG`, `TAGE_LOGBASE`,
+`TAGE_UPERIOD`), so one binary runs all experiments. Bimodal and gshare (`branch/bimodalp`, `branch/gsharep`) are sized by
+`BP_LOGSIZE` and `GS_LOGSIZE` so they can be compared at the same storage as TAGE.
 
-**Bimodal** is the simplest predictor. It keeps a table of 2-bit saturating counters indexed by the branch address (PC). A branch that was mostly taken recently is predicted taken. It cannot see patterns across branches.
+## 2. Layout
+```
+branch/tage, bimodalp, gsharep   the three predictors (copied into ChampSim by setup.sh)
+setup.sh                         installs them into ChampSim and builds three binaries
+run_experiments.py               runs the experiments, writes results/results.csv (resumable)
+make_figures.py                  draws results/figures/*.png from the CSV
+results/                         results.csv and the three figures
+original_version/                the first version of this project (kept unchanged for reference)
+```
 
-**gshare** XORs the PC with the **global history**, a shift register of the last N branch outcomes (1 = taken). It captures correlation between branches ("if the last 3 branches were T,N,T then this one is taken"). The downside is that unrelated branches can collide on the same entry (aliasing).
+## 3. Build and run (Linux / WSL)
+ChampSim commit used: `5f0be14a12f81baec35583dd4721afa654e93981`.
+```bash
+git clone --recursive https://github.com/ChampSim/ChampSim.git ~/ChampSim
+cd ~/ChampSim && git checkout 5f0be14a12f81baec35583dd4721afa654e93981 && git submodule update --init
+vcpkg/bootstrap-vcpkg.sh && vcpkg/vcpkg install
+cd <this repo> && ./setup.sh ~/ChampSim            # builds champsim_tage / _bimodalp / _gsharep (mispredict penalty 15)
+# traces: 400.perlbench-41B, 403.gcc-16B, 445.gobmk-17B from https://dpc3.compas.cs.stonybrook.edu/champsim-traces/speccpu/ into ~/traces
+python3 run_experiments.py --champsim ~/ChampSim/bin --traces ~/traces --warmup 5000000 --sim 20000000 --exp E1,E2,E3 --jobs 6 --out results/results.csv
+python3 make_figures.py
+```
+Use `--exp E0` to re-run the 8 variants of the original version as a check.
 
-**TAGE** (TAgged GEometric history length) is the state-of-the-art idea behind most modern predictors. Its three key ideas:
+## 4. Results
+Setup: 5M warmup + 20M simulated instructions per run, mispredict penalty 15 cycles, each setting run once.
+Storage counts only the predictor tables (counters, tags, `u`).
 
-1. **Geometric history lengths.** There are several tables, each indexed by a hash of PC and a *different length* of global history, for example 5, 15, 44 and 130 branches. Lengths grow roughly geometrically (each is about 3x the last). Short histories learn quickly and handle easy branches. Long histories catch rare, deeply correlated patterns. A geometric series covers both with few tables.
-2. **Partial tags.** Each entry stores a small tag (here 9 bits) taken from a hash of PC and history. A lookup counts as a "hit" only if the tag matches. This avoids the aliasing problem of gshare, because an entry is only used if it probably belongs to this branch and history.
-3. **Longest match wins.** On each prediction, all tables are checked. The hitting table with the **longest history** (the *provider*) makes the prediction. If nothing hits, the **base bimodal** predictor is used. The next-longest hit is the *alternate* prediction (*altpred*).
+### 4.1 Equal storage (E1) -- `results/figures/fig1_storage.png`
+Average over the three traces:
 
-**Update and allocation policy** (the core of the algorithm):
-- **Counter update:** the provider's 3-bit counter moves toward the actual outcome. If there was no provider, the base counter is updated.
-- **Useful bit (`u`, 2 bits):** an entry's `u` is incremented when it was right and the alternate was wrong, so it is worth keeping. It is decremented if it was wrong where the alternate was right.
-- **Allocation on misprediction:** if the prediction was wrong, we try to create a new entry in a table with a **longer history** than the provider. We look for an entry with `u == 0` and overwrite it with the new tag, initialising the counter weakly toward the actual outcome. The reasoning is that if a short history failed, a longer one might distinguish the case.
-- **No free slot:** if every longer table has `u > 0`, we decrement their `u` values (so slots eventually free up).
-- **Aging:** every 256K updates, all `u` bits are halved, so stale entries don't block allocation forever.
+| Storage | bimodal MPKI | gshare MPKI | TAGE MPKI | bimodal IPC | gshare IPC | TAGE IPC |
+|---|---|---|---|---|---|---|
+| 4 KB | 12.05 | 10.61 | 8.11 | 1.238 | 1.280 | 1.340 |
+| 8 KB | 11.93 | 9.15 | 6.79 | 1.240 | 1.314 | 1.379 |
+| 16 KB | 11.91 | 8.13 | 5.87 | 1.239 | 1.342 | 1.410 |
+| 32 KB | 11.84 | 7.37 | 5.20 | 1.242 | 1.365 | 1.437 |
+| 64 KB | 11.84 | 6.82 | 4.74 | 1.242 | 1.383 | 1.458 |
 
-## 4. What the code does
+Per trace, MPKI:
 
-Everything is in `ChampSim/branch/tage/`:
-- `tage.h`: the data structures and compile-time parameters.
-  - `TAGE_NT` is the number of tagged tables (default 4).
-  - `TAGE_HL` is the history lengths (default `5,15,44,130`).
-  - `TAGE_LOGSZ` is log2 of entries per table (default 10, so 1024).
-  - `TAGE_TAGBITS` is the tag width (default 9).
-  - `TAGE_LOGBASE` is log2 of base table size (default 13).
-  - Each entry holds `tag` (9 bits), `ctr` (3 bits) and `u` (2 bits).
-- `tage.cc`:
-  - `fold()` compresses the first `len` history bits into a few bits by XOR-folding, so a 130-bit history can index a 1024-entry table.
-  - `predict_branch()` computes each table's index and tag, finds the provider and alternate, and returns the provider's prediction (or the base prediction).
-  - `last_branch_result()` is called when the real outcome is known. It runs allocation, updates the useful bits and counters, ages the `u` bits, and shifts the outcome into the global history.
-
-ChampSim calls these two functions through its branch-predictor interface (same as `branch/gshare/`). The predictor is selected by `"branch_predictor": "tage"` in `champsim_config.json`.
-
-## 5. The experiment scripts
-
-- `run_experiments.sh` builds bimodal, gshare and 8 TAGE variants (passing `-DTAGE_...` flags to recompile) and runs each on all 3 traces (5M warmup plus 20M simulated instructions).
-  - **Known bug:** it parsed the *warmup* IPC instead of the final IPC, so the IPC column in `results.csv` / `run.log` is wrong. Those two files are obsolete. MPKI in them is fine.
-- `rerun_parallel.sh` re-runs the built binaries in parallel with correct parsing and writes **`results_final.csv`**, the file to use.
-
-TAGE variants tested:
-
-| Name | Tables | History lengths | Entries/table | Approx. storage* |
+| Trace | Storage | bimodal | gshare | TAGE |
 |---|---|---|---|---|
-| t4_default | 4 | 5,15,44,130 | 1024 | about 9 KB |
-| t2 | 2 | 8,44 | 1024 | about 5.5 KB |
-| t3 | 3 | 5,20,80 | 1024 | about 7 KB |
-| t4_short | 4 | 2,4,8,16 | 1024 | about 9 KB |
-| t4_long | 4 | 8,32,128,256 | 1024 | about 9 KB |
-| t4_small | 4 | 5,15,44,130 | 256 | about 3.75 KB |
-| t4_big | 4 | 5,15,44,130 | 4096 | about 30 KB |
-| t4_huge | 4 | 5,15,44,130 | 16384 | about 114 KB |
+| perlbench | 4 KB | 10.430 | 8.893 | **5.759** |
+| perlbench | 8 KB | 10.550 | 8.001 | **4.993** |
+| perlbench | 16 KB | 10.410 | 7.378 | **4.685** |
+| perlbench | 32 KB | 10.270 | 7.034 | **4.551** |
+| perlbench | 64 KB | 10.280 | 6.682 | **4.473** |
+| gcc | 4 KB | 0.651 | 0.373 | **0.188** |
+| gcc | 8 KB | 0.650 | 0.328 | **0.164** |
+| gcc | 16 KB | 0.691 | 0.281 | **0.158** |
+| gcc | 32 KB | 0.651 | 0.268 | **0.156** |
+| gcc | 64 KB | 0.650 | 0.256 | **0.155** |
+| gobmk | 4 KB | 25.060 | 22.550 | **18.370** |
+| gobmk | 8 KB | 24.590 | 19.110 | **15.200** |
+| gobmk | 16 KB | 24.630 | 16.730 | **12.780** |
+| gobmk | 32 KB | 24.590 | 14.810 | **10.900** |
+| gobmk | 64 KB | 24.600 | 13.510 | **9.587** |
 
-*Storage = tables x entries x 14 bits, plus the base table (8192 x 2 bits = 2 KB). These are my own hand estimates and are not computed by the code. gshare uses 16384 x 2 bits = 4 KB. Bimodal's size was not checked.
+- TAGE has the lowest MPKI at every size on every trace.
+- TAGE reaches gshare's accuracy with less storage: at 8 KB it beats gshare at 64 KB on perlbench and gcc; on gobmk it takes 16 KB.
+- Bimodal barely changes with size. gcc is very easy for all predictors (below 0.7 MPKI), so its IPC hardly moves.
 
-## 6. Results (`results_final.csv`)
-
-Format: MPKI / IPC.
-
-| Predictor | perlbench | gcc | gobmk |
+### 4.2 Number of tagged tables (E2, 16 KB) -- `fig2_tables.png`
+| Tagged tables | perlbench | gcc | gobmk |
 |---|---|---|---|
-| bimodal | 10.57 / 0.802 | 0.65 / 2.216 | 24.76 / 1.134 |
-| gshare | 11.38 / 0.804 | 0.48 / 2.223 | 28.52 / 1.088 |
-| **TAGE default** | **4.89 / 0.880** | **0.16 / 2.255** | **14.88 / 1.364** |
+| nt=1 | 8.786 | 0.456 | 19.39 |
+| nt=2 | 5.497 | 0.199 | 17.42 |
+| nt=3 | 4.841 | 0.167 | 14.59 |
+| nt=4 | 4.685 | 0.158 | 12.78 |
+| nt=6 | 4.783 | 0.162 | 12.91 |
 
-Findings:
-- TAGE cuts MPKI by roughly 40-75% versus bimodal and gshare, and IPC rises by about 2-22%.
-- **More tables help**, with diminishing returns: 2 → 3 → 4 tables gives gobmk MPKI 16.6 → 15.6 → 14.9.
-- **Geometric lengths beat both extremes.** Too short (2..16) and too long (8..256) are both worse than 5..130.
-- **More storage helps** (gobmk: 19.3 → 14.9 → 10.9 → 8.8 MPKI as entries go 256 → 16384). gcc saturates early, so it only needs a small table.
-- IPC tracks MPKI, but the IPC gain is modest because the config uses `mispredict_penalty: 1`, which is unrealistically low. Real CPUs lose roughly 15-20 cycles per misprediction.
+MPKI falls from 1 to 4 tables on all three traces and does not improve at 6. The 3- and 6-table runs use about 12.5 KB of the 16 KB because table sizes are powers of two.
 
-## 7. Is the assignment done?
-
-**Mostly yes.** Done:
-- Simplified TAGE (base plus 4 tagged tables) is implemented with geometric history, partial tags, allocation and update.
-- It was compared with bimodal and gshare on 3 traces.
-- Number of tables, history lengths and storage were varied, and the effect on MPKI and IPC was measured.
-
-**Not done / honest gaps**
-- **No written report or plots.** The deliverable probably wants a report, and the table and findings above can seed it. I can generate charts from `results_final.csv` if you want.
-- **Storage is not measured in code** and the table above is an estimate. I'd also vary storage at *fixed* tables, which was done (entries/table), but not total budget swept in KB against gshare/bimodal at the *same* size, which is a fairer comparison.
-- **Mispredict penalty is 1.** For more meaningful IPC, re-run with about 15-20.
-- **Simplifications vs. the paper:** no "use alternate on newly allocated entry" rule, a single allocation per misprediction, naive history folding (slow but correct), and no statistical corrector or loop predictor (these are in the 2011 paper). Entries are initialised with tag 0, so there are a few false hits early on.
-- Only 3 traces and 20M instructions, so the trends are solid but the numbers are approximate.
-- I did not read the two papers for you. Reading the first (2006) paper's Sections 2-3 would let you explain the design in a viva.
-
-## 8. What to learn (short list)
-1. Branch prediction basics: 2-bit saturating counters, global history, aliasing.
-2. How bimodal and gshare work (the ChampSim sources in `ChampSim/branch/` are short).
-3. TAGE: the three ideas in section 3, plus the allocation and useful-bit policy. Read the 2006 paper (Sections 2-3), then skim the 2011 paper for the extras.
-4. Metrics: MPKI vs IPC, and why mispredict penalty links them.
-5. ChampSim basics: config JSON, building, trace format, warmup vs simulation.
-
-## 9. How to reproduce
-```bash
-cd ChampSim
-./config.sh champsim_config.json && make -j8
-bin/champsim --warmup-instructions 5000000 --simulation-instructions 20000000 ../traces/400.perlbench-41B.champsimtrace.xz
-# full sweep:
-cd .. && ./run_experiments.sh      # builds variants (slow)
-./rerun_parallel.sh                # correct IPC -> results_final.csv
-```
-
-## 10. Realistic mispredict penalty (15 cycles): `results_p15.csv`
-Rebuilt every variant with `mispredict_penalty = 15` (`rerun_penalty.sh`). IPC now separates the predictors clearly:
-
-| Predictor | perlbench IPC | gcc IPC | gobmk IPC |
+### 4.3 History lengths (E3, 4 tables, 16 KB) -- `fig3_history.png`
+| Longest history (shortest = 5) | perlbench | gcc | gobmk |
 |---|---|---|---|
-| bimodal | 0.720 | 2.177 | 0.819 |
-| gshare | 0.717 | 2.195 | 0.763 |
-| TAGE default | 0.832 (+16%) | 2.245 (+3%) | 1.071 (+31%) |
-| TAGE 114 KB (t4_huge) | 0.843 | 2.246 | 1.329 (+62%) |
+| maxh=20 | 5.886 | 0.233 | 12.63 |
+| maxh=60 | 5.025 | 0.167 | 11.91 |
+| maxh=130 | 4.685 | 0.158 | 12.78 |
+| maxh=300 | 4.702 | 0.158 | 13.82 |
+| maxh=600 | 4.809 | 0.166 | 14.78 |
 
-Plots are in `plots/`: `p1_*` is penalty 1 and `p15_*` is penalty 15. They cover predictor comparison (MPKI and IPC), number of tables, history lengths, and the storage sweep.
-`make_plots.py` regenerates them.
+| Shortest history (longest = 130) | perlbench | gcc | gobmk |
+|---|---|---|---|
+| minh=2 | 4.729 | 0.179 | 13.51 |
+| minh=10 | 4.713 | 0.159 | 12.52 |
+| minh=20 | 4.897 | 0.166 | 14.50 |
 
-## 11. Repo layout and setup (for teammates)
-The repo holds only our work. ChampSim itself and the traces are not stored here.
-- `tage_module/`: `tage.h`, `tage.cc` and `champsim_config.json`.
-- scripts, `results_*.csv` (`results.csv` has a wrong IPC column, ignore it), `plots/`, this README.
+The default (5 and 130) is best or within about 1% on perlbench and gcc. gobmk does better with a shorter longest length (60) and a shortest length of 10. A shortest length of 20 is worse than the default on all three traces.
 
-Setup:
-```bash
-git clone https://github.com/ChampSim/ChampSim && cd ChampSim
-git submodule update --init && vcpkg/bootstrap-vcpkg.sh && vcpkg/vcpkg install
-mkdir branch/tage && cp ../tage_module/tage.* branch/tage/ && cp ../tage_module/champsim_config.json .
-./config.sh champsim_config.json && make -j8
-```
-Download the traces from https://dpc3.compas.cs.stonybrook.edu/champsim-traces/speccpu/ into `../traces/`.
-The scripts expect the `ChampSim/` and `traces/` folders to sit beside them.
+## 5. Checks done
+- With default settings the runtime-configurable predictor gives results identical to the original version: all 24 TAGE rows (8 variants x 3 traces) match `original_version/results_p15.csv` on the real traces (experiment E0).
+- The storage counter in the code reports 73,728 bits (9 KB) for the default configuration, matching the hand estimate.
+- The same configuration (4 tables, 5/15/44/130, 16 KB) gives the same MPKI in E1, E2 and E3.
+
+## 6. Limitations
+- Only three SPEC CPU2006 integer traces and 20M instructions per run; each setting was run once, so differences of a few percent should not be ranked.
+- The bimodal and gshare used here are our own size-adjustable versions: they learn only from conditional branches and hash slightly differently from ChampSim's built-in ones, so their numbers differ from those in `original_version/`. TAGE (like the built-ins) also learns from jumps, calls and returns.
+- Storage excludes the history registers, for all predictors.
+- IPC depends on the mispredict penalty (15 here; `original_version/` also has runs with 1).
+
+## 7. Credits
+The first version (predictor, 8-variant experiments, plots) is in `original_version/` (original README inside). The current version adds
+runtime-configurable parameters, equal-storage baselines and the experiments in section 4.

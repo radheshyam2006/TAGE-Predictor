@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Install the env-configurable TAGE + parameterised bimodal/gshare into a ChampSim checkout and build 3 binaries.
-# Usage:  [PEN=15] ./setup_extension.sh ~/ChampSim      (PEN = mispredict_penalty, default 15; teammate's p1 run used 1)
+# Install the three predictors into a ChampSim checkout and build one binary per predictor.
+# Usage:  [PEN=15] ./setup.sh ~/ChampSim      (PEN = mispredict_penalty; the reported results use 15)
 set -euo pipefail
 CS="${1:?path to ChampSim checkout}"; PEN="${PEN:-15}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-mkdir -p "$CS/branch/tage" && cp "$HERE"/tage_module/tage.h "$HERE"/tage_module/tage.cc "$CS/branch/tage/"
-cp -r "$HERE"/branch/bimodalp "$HERE"/branch/gsharep "$CS"/branch/
+mkdir -p "$CS/branch"
+cp -r "$HERE"/branch/tage "$HERE"/branch/bimodalp "$HERE"/branch/gsharep "$CS"/branch/
 cd "$CS"
 for P in tage bimodalp gsharep; do
   python3 - "$P" "$PEN" <<'PY'
